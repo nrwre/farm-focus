@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="handleColor">#FFF4E7C1</color>
+    <color name="drawerScrim">#E62B1B14</color>
+    <color name="appLabelColor">#FFFFFFFF</color>
+    <color name="colorPrimary">#4F7942</color>
+    <color name="colorPrimaryDark">#3A5C31</color>
+    <color name="colorAccent">#FFD700</color>
+</resources>
