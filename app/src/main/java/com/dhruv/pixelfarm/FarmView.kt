@@ -385,14 +385,33 @@ class FarmView @JvmOverloads constructor(
         if (vx < -0.4f) facingLeft = true else if (vx > 0.4f) facingLeft = false
         val moving = kotlin.math.abs(targetCx - farmerCx) > w * 0.01f
 
-        // vertical motion: walk bounce while moving, gentle breathing while still
-        val bob = if (moving)
-            kotlin.math.abs(sin(tSec * 9f)) * charH * 0.05f
-        else
-            sin(tSec * 2.2f) * charH * 0.012f
+        // pick an animation: a walk cycle whenever he's actually travelling,
+        // otherwise the frames for whatever he's doing in place.
+        val (animKey, fps, fallbackKey) = if (moving)
+            Triple(Sprites.FARMER_WALK, WALK_FPS, Sprites.FARMER_IDLE)
+        else when (farmer.action) {
+            FarmRepository.FarmerAction.PLOUGH -> Triple(Sprites.FARMER_PLOUGH, PLOUGH_FPS, Sprites.FARMER_IDLE)
+            FarmRepository.FarmerAction.WATER -> Triple(Sprites.FARMER_WATER, WATER_FPS, Sprites.FARMER_IDLE)
+            FarmRepository.FarmerAction.NAP -> Triple(Sprites.FARMER_NAP, NAP_FPS, Sprites.FARMER_IDLE)
+            FarmRepository.FarmerAction.IDLE -> Triple(Sprites.FARMER_IDLE, IDLE_FPS, Sprites.FARMER_IDLE)
+        }
+        var frames = Sprites.frames(context, animKey)
+        if (frames.isEmpty() && fallbackKey != animKey) frames = Sprites.frames(context, fallbackKey)
+        val multiFrame = frames.size > 1
+
+        // If the art itself animates, don't also fake a walk bounce (avoids
+        // double motion); keep only a faint breathing bob for stills.
+        val bob = when {
+            moving && !multiFrame -> kotlin.math.abs(sin(tSec * 9f)) * charH * 0.05f
+            !moving -> sin(tSec * 2.2f) * charH * 0.012f
+            else -> 0f
+        }
         val feetY = baseline - bob
 
-        val bmp = Sprites.get(context, farmerSprite(farmer.action))
+        val bmp = if (frames.isNotEmpty()) {
+            val idx = if (multiFrame) ((tSec * fps).toInt()) % frames.size else 0
+            frames[idx]
+        } else null
 
         // contact shadow (shrinks a touch on the up-beat of the bounce)
         val shW = (bmp?.let { minOf(maxW, charH * it.width / it.height) } ?: (charH * 0.6f)) * (0.9f - bob / charH)
@@ -403,13 +422,6 @@ class FarmView @JvmOverloads constructor(
         } else {
             drawFarmerFallback(canvas, farmer.action, farmerCx, feetY, charH)
         }
-    }
-
-    private fun farmerSprite(action: FarmRepository.FarmerAction): String = when (action) {
-        FarmRepository.FarmerAction.PLOUGH -> Sprites.FARMER_PLOUGH
-        FarmRepository.FarmerAction.WATER -> Sprites.FARMER_WATER
-        FarmRepository.FarmerAction.NAP -> Sprites.FARMER_NAP
-        FarmRepository.FarmerAction.IDLE -> Sprites.FARMER_IDLE
     }
 
     private fun drawFarmerFallback(canvas: Canvas, action: FarmRepository.FarmerAction, cx: Float, baseline: Float, charH: Float) {
@@ -515,6 +527,13 @@ class FarmView @JvmOverloads constructor(
 
     companion object {
         private const val EASE_RATE = 3.5f // farmer walk easing (higher = snappier)
+
+        // playback speed (frames/sec) for each farmer animation sequence
+        private const val WALK_FPS = 8f
+        private const val WATER_FPS = 5f
+        private const val PLOUGH_FPS = 5f
+        private const val IDLE_FPS = 2.5f
+        private const val NAP_FPS = 1.5f
 
         // DEBUG fast-forward: each long-press adds this much qualifying time.
         private const val DEBUG_FASTFORWARD = true

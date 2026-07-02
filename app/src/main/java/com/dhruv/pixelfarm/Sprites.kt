@@ -17,9 +17,12 @@ object Sprites {
 
     // known sprite keys (must match the placeholder filenames)
     const val FARMER_IDLE = "farmer_idle"
+    const val FARMER_WALK = "farmer_walk"
     const val FARMER_PLOUGH = "farmer_plough"
     const val FARMER_WATER = "farmer_water"
     const val FARMER_NAP = "farmer_nap"
+
+    private const val MAX_FRAMES = 16
 
     val CROP_STAGE = arrayOf(
         "crop_0_seed", "crop_1_sprout", "crop_2_growing", "crop_3_mature", "crop_4_ripe"
@@ -32,6 +35,7 @@ object Sprites {
     const val CLOUD = "cloud"
 
     private val cache = HashMap<String, Bitmap?>()
+    private val frameCache = HashMap<String, List<Bitmap>>()
 
     /** Returns the bitmap for [name], or null if no such drawable exists. */
     fun get(context: Context, name: String): Bitmap? {
@@ -40,18 +44,40 @@ object Sprites {
 
         val res = context.resources
         val id = res.getIdentifier(name, "drawable", context.packageName)
-        val bmp = if (id != 0) {
-            try {
-                val opts = BitmapFactory.Options().apply { inScaled = false }
-                trimTransparent(BitmapFactory.decodeResource(res, id, opts))
-            } catch (t: Throwable) {
-                null
-            }
-        } else {
-            null
-        }
+        val bmp = if (id != 0) load(res, id) else null
         cache[name] = bmp
         return bmp
+    }
+
+    /**
+     * Returns the animation frames for [key]. Looks for a numbered sequence
+     * "<key>_1", "<key>_2", ... (any length up to [MAX_FRAMES]); if none exist,
+     * falls back to a single "<key>" bitmap; if that's missing too, returns an
+     * empty list. So `farmer_walk_1..4` animates, but a lone `farmer_walk` (or
+     * nothing) still works.
+     */
+    fun frames(context: Context, key: String): List<Bitmap> {
+        frameCache[key]?.let { return it }
+        val res = context.resources
+        val pkg = context.packageName
+        val list = ArrayList<Bitmap>()
+        var i = 1
+        while (i <= MAX_FRAMES) {
+            val id = res.getIdentifier("${key}_$i", "drawable", pkg)
+            if (id == 0) break
+            load(res, id)?.let { list.add(it) }
+            i++
+        }
+        if (list.isEmpty()) get(context, key)?.let { list.add(it) }
+        frameCache[key] = list
+        return list
+    }
+
+    private fun load(res: android.content.res.Resources, id: Int): Bitmap? = try {
+        val opts = BitmapFactory.Options().apply { inScaled = false }
+        trimTransparent(BitmapFactory.decodeResource(res, id, opts))
+    } catch (t: Throwable) {
+        null
     }
 
     /**
