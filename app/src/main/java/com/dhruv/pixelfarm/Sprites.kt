@@ -60,33 +60,39 @@ object Sprites {
         frameCache[key]?.let { return it }
         val res = context.resources
         val pkg = context.packageName
-        val list = ArrayList<Bitmap>()
+
+        // decode the raw sequence (no per-frame trim yet)
+        val raws = ArrayList<Bitmap>()
         var i = 1
         while (i <= MAX_FRAMES) {
             val id = res.getIdentifier("${key}_$i", "drawable", pkg)
             if (id == 0) break
-            load(res, id)?.let { list.add(it) }
+            decodeRaw(res, id)?.let { raws.add(it) }
             i++
         }
-        if (list.isEmpty()) get(context, key)?.let { list.add(it) }
+
+        val list: List<Bitmap> = if (raws.isEmpty()) {
+            // no numbered sequence -> single bitmap fallback (trimmed on its own)
+            get(context, key)?.let { listOf(it) } ?: emptyList()
+        } else {
+            trimTogether(raws)
+        }
         frameCache[key] = list
         return list
     }
 
-    private fun load(res: android.content.res.Resources, id: Int): Bitmap? = try {
+    private fun decodeRaw(res: android.content.res.Resources, id: Int): Bitmap? = try {
         val opts = BitmapFactory.Options().apply { inScaled = false }
-        trimTransparent(BitmapFactory.decodeResource(res, id, opts))
+        BitmapFactory.decodeResource(res, id, opts)
     } catch (t: Throwable) {
         null
     }
 
-    /**
-     * Crops away fully-transparent borders so a sprite's visible art fills its
-     * box. Without this, padding baked into the PNG makes things look like they
-     * hover and makes scaling inconsistent between assets.
-     */
-    private fun trimTransparent(src: Bitmap?): Bitmap? {
-        if (src == null) return null
+    private fun load(res: android.content.res.Resources, id: Int): Bitmap? =
+        trimTransparent(decodeRaw(res, id))
+
+    /** [minX, minY, maxX, maxY] of non-transparent content, or null if none. */
+    private fun contentBounds(src: Bitmap): IntArray? {
         val w = src.width
         val h = src.height
         val row = IntArray(w)
@@ -102,8 +108,44 @@ object Sprites {
                 }
             }
         }
-        if (maxX < minX || maxY < minY) return src // fully transparent or opaque edge-to-edge
-        if (minX == 0 && minY == 0 && maxX == w - 1 && maxY == h - 1) return src
-        return Bitmap.createBitmap(src, minX, minY, maxX - minX + 1, maxY - minY + 1)
+        return if (maxX < minX || maxY < minY) null else intArrayOf(minX, minY, maxX, maxY)
+    }
+
+    /**
+     * Crops away fully-transparent borders so a sprite's visible art fills its
+     * box (stops single sprites hovering / scaling inconsistently).
+     */
+    private fun trimTransparent(src: Bitmap?): Bitmap? {
+        if (src == null) return null
+        val b = contentBounds(src) ?: return src
+        if (b[0] == 0 && b[1] == 0 && b[2] == src.width - 1 && b[3] == src.height - 1) return src
+        return Bitmap.createBitmap(src, b[0], b[1], b[2] - b[0] + 1, b[3] - b[1] + 1)
+    }
+
+    /**
+     * Crops every frame to the SAME (union) bounding box across the whole
+     * sequence, so shared padding is removed but limbs that move between frames
+     * don't cause the sprite to jump/bob. Assumes frames share one canvas size.
+     */
+    private fun trimTogether(raws: List<Bitmap>): List<Bitmap> {
+        var minX = Int.MAX_VALUE; var minY = Int.MAX_VALUE
+        var maxX = -1; var maxY = -1
+        for (b in raws) {
+            contentBounds(b)?.let {
+                if (it[0] < minX) minX = it[0]
+                if (it[1] < minY) minY = it[1]
+                if (it[2] > maxX) maxX = it[2]
+                if (it[3] > maxY) maxY = it[3]
+            }
+        }
+        if (maxX < minX || maxY < minY) return raws // all transparent -> leave as-is
+        // clamp union box to the smallest frame so createBitmap never overruns
+        val w = raws.minOf { it.width }
+        val h = raws.minOf { it.height }
+        val x0 = minX.coerceIn(0, w - 1)
+        val y0 = minY.coerceIn(0, h - 1)
+        val cw = (maxX - x0 + 1).coerceIn(1, w - x0)
+        val ch = (maxY - y0 + 1).coerceIn(1, h - y0)
+        return raws.map { Bitmap.createBitmap(it, x0, y0, cw, ch) }
     }
 }
