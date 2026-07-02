@@ -24,9 +24,34 @@ object FarmRepository {
     // Economy constants (tune-able, not magic numbers).
     const val SECONDS_PER_GROWTH_STAGE = 60L * 15 // 15 qualifying minutes per stage
     const val STAGES = 5 // seed -> sprout -> ... -> harvest-ready
-    private const val CYCLE_SECONDS = SECONDS_PER_GROWTH_STAGE * STAGES
+    const val PLOTS = 5 // plots in the field
+    const val EMPTY_PLOT = -1 // getPlotStage() sentinel: soil prepared but nothing planted yet
+
+    // A new plot is planted this often (in qualifying time), so the field
+    // fills in left-to-right as restraint accumulates instead of all at once.
+    const val PLANT_INTERVAL_SECONDS = 60L * 5 // one new plot every 5 qualifying minutes
+
+    // Farmer's daily routine, in wall-clock seconds. Realistic dwell times so
+    // he settles into an activity instead of flickering between them.
+    private const val WATER_SECONDS_PER_PLOT = 10L
+    private const val PLOUGH_SECONDS = 60L * 20
+    private const val IDLE_SECONDS = 60L
+    private const val NAP_SECONDS = 60L * 15
+    private val DAY_CYCLE_SECONDS =
+        PLOTS * WATER_SECONDS_PER_PLOT + PLOUGH_SECONDS + IDLE_SECONDS + NAP_SECONDS
 
     enum class FarmerAction { PLOUGH, WATER, NAP, IDLE }
+
+    /**
+     * Everything the renderer needs to draw the farmer this instant.
+     * [wateringPlot] is the plot index currently being watered (or -1), and
+     * [wateredPlots] are the plots whose soil should currently look wet.
+     */
+    data class FarmerState(
+        val action: FarmerAction,
+        val wateringPlot: Int,
+        val wateredPlots: Set<Int>
+    )
 
     private lateinit var prefs: SharedPreferences
     private var initialized = false
@@ -98,14 +123,36 @@ object FarmRepository {
     }
 
     /**
-     * Current crop stage. [offsetSec] lets the renderer stagger a row of plots
-     * so the field shows a range of growth at once -- purely cosmetic, the
-     * accrual math stays centralized here.
+     * DEBUG ONLY: jump qualifying time forward so the field's growth can be
+     * watched without waiting real minutes. Wired to a long-press in FarmView,
+     * gated behind a flag there. Remove/disable before shipping.
      */
-    fun getCropStage(offsetSec: Long = 0L): Int {
-        val posInCycle = (producePoints + offsetSec) % CYCLE_SECONDS
-        return (posInCycle / SECONDS_PER_GROWTH_STAGE).toInt().coerceIn(0, STAGES - 1)
+    @Synchronized
+    fun debugAdvance(seconds: Long) {
+        producePoints += seconds
+        lastTimestamp = System.currentTimeMillis()
+        persist()
     }
+
+    /**
+     * Growth stage of plot [index], or [EMPTY_PLOT] if it hasn't been planted
+     * yet. Plots are planted one every [PLANT_INTERVAL_SECONDS] of qualifying
+     * time, so the field fills in left-to-right and each plot then climbs the
+     * growth stages -- the whole field ends lush after sustained restraint and
+     * stays that way (no reset in v1).
+     */
+    fun getPlotStage(index: Int): Int {
+        val plantedAt = index * PLANT_INTERVAL_SECONDS
+        val age = producePoints - plantedAt
+        if (age < 0) return EMPTY_PLOT
+        return (age / SECONDS_PER_GROWTH_STAGE).toInt().coerceAtMost(STAGES - 1)
+    }
+
+    /** How many plots are fully grown (harvest-ready). */
+    fun ripeCount(): Int = (0 until PLOTS).count { getPlotStage(it) == STAGES - 1 }
+
+    /** How many plots have been planted (stage >= seed). */
+    fun plantedCount(): Int = (0 until PLOTS).count { getPlotStage(it) != EMPTY_PLOT }
 
     /** Human-readable qualifying-time total, e.g. "1h 20m", "5m 12s", "40s". */
     fun formatProduceTime(): String {
@@ -120,27 +167,42 @@ object FarmRepository {
         }
     }
 
-    /** Farmer action for the given animation frame. Naps more often at night. */
-    fun getFarmerAction(frame: Long): FarmerAction {
-        if (!isFarming) return FarmerAction.IDLE
-
+    private fun isNight(): Boolean {
         val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-        val isNight = hour < 6 || hour >= 22
+        return hour < 6 || hour >= 22
+    }
 
-        return if (isNight) {
-            when ((frame % 5)) {
-                0L -> FarmerAction.PLOUGH
-                1L -> FarmerAction.WATER
-                2L, 3L -> FarmerAction.NAP
-                else -> FarmerAction.IDLE
-            }
-        } else {
-            when ((frame % 4)) {
-                0L -> FarmerAction.PLOUGH
-                1L -> FarmerAction.WATER
-                2L -> FarmerAction.NAP
-                else -> FarmerAction.IDLE
-            }
+    /**
+     * The farmer's current activity. Driven by [sessionElapsedSec] -- seconds
+     * since the user opened the launcher -- so he greets you by watering the
+     * crops first, then settles into the longer tasks (rather than the watering
+     * pass happening at some fixed clock time you'd never catch). He dwells on
+     * each task for realistic stretches instead of flickering. One loop:
+     * water every plot (~10s each) -> plough (20m) -> idle (1m) -> nap (15m).
+     * At night he just sleeps.
+     */
+    fun getFarmerState(sessionElapsedSec: Long, ignoreNight: Boolean = false): FarmerState {
+        if (isNight() && !ignoreNight) {
+            return FarmerState(FarmerAction.NAP, -1, emptySet())
         }
+
+        var pos = sessionElapsedSec % DAY_CYCLE_SECONDS
+
+        val waterPhase = PLOTS * WATER_SECONDS_PER_PLOT
+        if (pos < waterPhase) {
+            val plot = (pos / WATER_SECONDS_PER_PLOT).toInt()
+            // plots already passed are wet; the current one becomes wet as he finishes
+            val alreadyWatered = (0 until plot).toSet()
+            return FarmerState(FarmerAction.WATER, plot, alreadyWatered)
+        }
+        pos -= waterPhase
+
+        // once watering is done the whole field stays wet until the next pass
+        val allWatered = (0 until PLOTS).toSet()
+        if (pos < PLOUGH_SECONDS) return FarmerState(FarmerAction.PLOUGH, -1, allWatered)
+        pos -= PLOUGH_SECONDS
+
+        if (pos < IDLE_SECONDS) return FarmerState(FarmerAction.IDLE, -1, allWatered)
+        return FarmerState(FarmerAction.NAP, -1, allWatered)
     }
 }

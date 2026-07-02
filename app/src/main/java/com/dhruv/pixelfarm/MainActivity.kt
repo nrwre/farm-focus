@@ -23,6 +23,7 @@ import kotlin.math.abs
  */
 class MainActivity : Activity() {
 
+    private lateinit var farmView: FarmView
     private lateinit var drawerContainer: View
     private lateinit var appGrid: RecyclerView
     private lateinit var handle: View
@@ -32,6 +33,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        farmView = findViewById(R.id.farmView)
         drawerContainer = findViewById(R.id.drawerContainer)
         appGrid = findViewById(R.id.appGrid)
         handle = findViewById(R.id.drawerHandle)
@@ -74,6 +76,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         FarmRepository.onLauncherResumed()
+        farmView.onResumed()
     }
 
     override fun onPause() {

@@ -17,7 +17,9 @@ import java.util.Calendar
  * inside [drawFarmer]/[drawCrops] will.
  *
  * The frame counter advances slowly (tamagotchi pace, not 60fps) since this
- * is meant to feel ambient rather than reactive.
+ * is meant to feel ambient rather than reactive. The farmer's activity and
+ * the crop stages both come from [FarmRepository]; the view only interpolates
+ * his horizontal position so walking between plots looks smooth.
  */
 class FarmView @JvmOverloads constructor(
     context: Context,
@@ -25,6 +27,14 @@ class FarmView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     private var frame: Long = 0L
+
+    // interpolated farmer x-position (NaN until first layout)
+    private var farmerX: Float = Float.NaN
+    private var placeFarmerAtHome = true
+
+    // when the current viewing session began; the farmer's routine is measured
+    // from here so he waters the crops each time you open the launcher
+    private var sessionStartMs: Long = System.currentTimeMillis()
 
     private val frameHandler = Handler(Looper.getMainLooper())
     private val frameRunnable = object : Runnable {
@@ -35,12 +45,29 @@ class FarmView @JvmOverloads constructor(
         }
     }
 
+    init {
+        // DEBUG: long-press fast-forwards qualifying time so the field's growth
+        // is watchable without waiting real minutes. Flip DEBUG_FASTFORWARD off
+        // (or remove) before shipping.
+        isLongClickable = true
+        setOnLongClickListener {
+            if (DEBUG_FASTFORWARD) {
+                FarmRepository.debugAdvance(DEBUG_FASTFORWARD_SECONDS)
+                invalidate()
+                true
+            } else {
+                false
+            }
+        }
+    }
+
     // --- sky / ground ---
     private val daySkyPaint = Paint().apply { color = Color.parseColor("#87CEEB") }
     private val nightSkyPaint = Paint().apply { color = Color.parseColor("#1B2A4A") }
     private val groundPaint = Paint().apply { color = Color.parseColor("#8B5A2B") }
     private val furrowPaint = Paint().apply { color = Color.parseColor("#734820") }
-    private val moundPaint = Paint().apply { color = Color.parseColor("#6E4420") }
+    private val dryMoundPaint = Paint().apply { color = Color.parseColor("#6E4420") }
+    private val wetMoundPaint = Paint().apply { color = Color.parseColor("#3B2411") } // watered soil
 
     // --- celestial ---
     private val sunPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#FFD86B") }
@@ -56,6 +83,8 @@ class FarmView @JvmOverloads constructor(
         Paint().apply { color = Color.parseColor("#3E6B2E") }  // harvest-ready
     )
     private val fruitPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#FFD700") }
+    private val seedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#3A240F") }
+    private val waterDropPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#6FB7E8") }
 
     // --- farmer ---
     private val farmerBodyPaint = Paint()
@@ -83,6 +112,14 @@ class FarmView @JvmOverloads constructor(
         frameHandler.post(frameRunnable)
     }
 
+    /** Called by MainActivity.onResume so the farmer's routine restarts (and he
+     *  re-waters) each time the home screen comes to the foreground. */
+    fun onResumed() {
+        sessionStartMs = System.currentTimeMillis()
+        placeFarmerAtHome = true
+        invalidate()
+    }
+
     override fun onDetachedFromWindow() {
         frameHandler.removeCallbacks(frameRunnable)
         super.onDetachedFromWindow()
@@ -96,6 +133,8 @@ class FarmView @JvmOverloads constructor(
 
         val groundTop = h * 0.5f
         val isNight = isNightNow()
+        val sessionElapsedSec = (System.currentTimeMillis() - sessionStartMs) / 1000L
+        val farmer = FarmRepository.getFarmerState(sessionElapsedSec, ignoreNight = DEBUG_FASTFORWARD)
 
         // sky + ground
         canvas.drawRect(0f, 0f, w, groundTop, if (isNight) nightSkyPaint else daySkyPaint)
@@ -103,8 +142,8 @@ class FarmView @JvmOverloads constructor(
 
         drawCelestial(canvas, w, groundTop, isNight)
         drawFurrows(canvas, w, h, groundTop)
-        drawCrops(canvas, w, h, groundTop)
-        drawFarmer(canvas, w, h, groundTop)
+        drawCrops(canvas, w, h, groundTop, farmer)
+        drawFarmer(canvas, w, h, groundTop, farmer)
         drawHud(canvas, w, h)
     }
 
@@ -112,6 +151,17 @@ class FarmView @JvmOverloads constructor(
         val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         return hour < 6 || hour >= 22
     }
+
+    /** x-center of plot [i] on the field, kept consistent for crops and farmer. */
+    private fun plotCenterX(w: Float, i: Int): Float {
+        val areaLeft = w * 0.30f
+        val areaRight = w * 0.97f
+        val slot = (areaRight - areaLeft) / FarmRepository.PLOTS
+        return areaLeft + slot * (i + 0.5f)
+    }
+
+    private fun cropBaseline(h: Float, groundTop: Float): Float =
+        h - (h - groundTop) * 0.10f
 
     private fun drawCelestial(canvas: Canvas, w: Float, groundTop: Float, isNight: Boolean) {
         val radius = w * 0.06f
@@ -138,46 +188,56 @@ class FarmView @JvmOverloads constructor(
         }
     }
 
-    private fun drawCrops(canvas: Canvas, w: Float, h: Float, groundTop: Float) {
-        val areaLeft = w * 0.30f
-        val areaRight = w * 0.97f
-        val baseline = h - (h - groundTop) * 0.10f
-        val slot = (areaRight - areaLeft) / NUM_PLOTS
-        val stalkWidth = slot * 0.45f
+    private fun drawCrops(
+        canvas: Canvas, w: Float, h: Float, groundTop: Float,
+        farmer: FarmRepository.FarmerState
+    ) {
+        val slotW = (w * 0.97f - w * 0.30f) / FarmRepository.PLOTS
+        val stalkWidth = slotW * 0.45f
+        val baseline = cropBaseline(h, groundTop)
         val maxCropHeight = (h - groundTop) * 0.7f
 
-        for (i in 0 until NUM_PLOTS) {
-            // stagger each plot one stage further so the field shows a range
-            val stage = FarmRepository.getCropStage(i.toLong() * FarmRepository.SECONDS_PER_GROWTH_STAGE)
-            val cx = areaLeft + slot * (i + 0.5f)
+        for (i in 0 until FarmRepository.PLOTS) {
+            val stage = FarmRepository.getPlotStage(i)
+            val cx = plotCenterX(w, i)
+            val watered = i in farmer.wateredPlots
 
-            // soil mound
-            val moundW = slot * 0.7f
+            // soil mound -- darker when watered (Stardew-style wet tile)
+            val moundW = slotW * 0.7f
             canvas.drawRect(
                 cx - moundW / 2f, baseline,
                 cx + moundW / 2f, baseline + (h - baseline) * 0.6f,
-                moundPaint
+                if (watered) wetMoundPaint else dryMoundPaint
             )
 
-            // stalk height scales with stage (seed is a small nub)
-            val heightFactor = 0.18f + stage * 0.205f
-            val cropH = maxCropHeight * heightFactor
-            canvas.drawRect(
-                cx - stalkWidth / 2f, baseline - cropH,
-                cx + stalkWidth / 2f, baseline,
-                cropPaints[stage]
-            )
+            if (stage == FarmRepository.EMPTY_PLOT) {
+                // prepared but unplanted: just a little seed hole
+                canvas.drawCircle(cx, baseline - stalkWidth * 0.15f, stalkWidth * 0.18f, seedPaint)
+            } else {
+                val heightFactor = 0.18f + stage * 0.205f
+                val cropH = maxCropHeight * heightFactor
+                canvas.drawRect(
+                    cx - stalkWidth / 2f, baseline - cropH,
+                    cx + stalkWidth / 2f, baseline,
+                    cropPaints[stage]
+                )
+                if (stage == FarmRepository.STAGES - 1) {
+                    canvas.drawCircle(cx, baseline - cropH, stalkWidth * 0.55f, fruitPaint)
+                }
+            }
 
-            // ripe crops get a golden fruit
-            if (stage == FarmRepository.STAGES - 1) {
-                canvas.drawCircle(cx, baseline - cropH, stalkWidth * 0.55f, fruitPaint)
+            // little water splash on the plot he's actively watering
+            if (i == farmer.wateringPlot) {
+                canvas.drawCircle(cx, baseline - stalkWidth * 0.3f, stalkWidth * 0.22f, waterDropPaint)
             }
         }
     }
 
-    private fun drawFarmer(canvas: Canvas, w: Float, h: Float, groundTop: Float) {
-        val action = FarmRepository.getFarmerAction(frame)
-        farmerBodyPaint.color = when (action) {
+    private fun drawFarmer(
+        canvas: Canvas, w: Float, h: Float, groundTop: Float,
+        farmer: FarmRepository.FarmerState
+    ) {
+        farmerBodyPaint.color = when (farmer.action) {
             FarmRepository.FarmerAction.PLOUGH -> Color.parseColor("#8B4513")
             FarmRepository.FarmerAction.WATER -> Color.parseColor("#4682B4")
             FarmRepository.FarmerAction.NAP -> Color.parseColor("#708090")
@@ -185,25 +245,37 @@ class FarmView @JvmOverloads constructor(
         }
 
         val bodyW = w * 0.10f
-        val bodyH = (h - groundTop) * 0.45f
-        val left = w * 0.06f
-        val baseline = h - (h - groundTop) * 0.10f
+        val homeX = w * 0.08f
 
-        if (action == FarmRepository.FarmerAction.NAP) {
-            // lie down: wide, short, with head to one side
+        // where the farmer wants to be this frame
+        val targetX = when (farmer.action) {
+            FarmRepository.FarmerAction.WATER ->
+                if (farmer.wateringPlot >= 0) plotCenterX(w, farmer.wateringPlot) - bodyW / 2f else homeX
+            else -> homeX
+        }
+        if (placeFarmerAtHome) {
+            farmerX = homeX // start each session at home, then walk out to the crops
+            placeFarmerAtHome = false
+        }
+        farmerX = if (farmerX.isNaN()) targetX else farmerX + (targetX - farmerX) * WALK_LERP
+
+        val bodyH = (h - groundTop) * 0.45f
+        val baseline = cropBaseline(h, groundTop)
+
+        if (farmer.action == FarmRepository.FarmerAction.NAP) {
+            // lie down: wide, short, head off to one side
             val napW = bodyW * 1.6f
             val napH = bodyH * 0.45f
-            canvas.drawRect(left, baseline - napH, left + napW, baseline, farmerBodyPaint)
+            canvas.drawRect(farmerX, baseline - napH, farmerX + napW, baseline, farmerBodyPaint)
             val headS = napH * 0.9f
-            canvas.drawRect(left + napW, baseline - napH, left + napW + headS, baseline, farmerHeadPaint)
+            canvas.drawRect(farmerX + napW, baseline - napH, farmerX + napW + headS, baseline, farmerHeadPaint)
         } else {
-            // stand: body + head stacked
             val bodyTop = baseline - bodyH
-            canvas.drawRect(left, bodyTop, left + bodyW, baseline, farmerBodyPaint)
+            canvas.drawRect(farmerX, bodyTop, farmerX + bodyW, baseline, farmerBodyPaint)
             val headS = bodyW * 0.85f
             canvas.drawRect(
-                left + (bodyW - headS) / 2f, bodyTop - headS,
-                left + (bodyW + headS) / 2f, bodyTop,
+                farmerX + (bodyW - headS) / 2f, bodyTop - headS,
+                farmerX + (bodyW + headS) / 2f, bodyTop,
                 farmerHeadPaint
             )
         }
@@ -215,9 +287,8 @@ class FarmView @JvmOverloads constructor(
         hudTextPaint.textSize = textSize
         hudStatusPaint.textSize = textSize
 
-        val stage = FarmRepository.getCropStage()
         val produceLine = "produce  ${FarmRepository.formatProduceTime()}"
-        val stageLine = "stage  ${stage + 1}/${FarmRepository.STAGES}"
+        val cropLine = "ripe  ${FarmRepository.ripeCount()}/${FarmRepository.PLOTS}"
         val farming = FarmRepository.isFarming
         val statusLine = if (farming) "FARMING" else "PAUSED"
         hudStatusPaint.color = if (farming) Color.parseColor("#7CFC7C") else Color.parseColor("#B0B0B0")
@@ -225,7 +296,7 @@ class FarmView @JvmOverloads constructor(
         val lineGap = textSize * 1.45f
         val panelW = maxOf(
             hudTextPaint.measureText(produceLine),
-            hudTextPaint.measureText(stageLine),
+            hudTextPaint.measureText(cropLine),
             hudStatusPaint.measureText(statusLine)
         ) + pad * 2f
         val panelH = lineGap * 3f + pad
@@ -235,13 +306,17 @@ class FarmView @JvmOverloads constructor(
         var y = pad + pad * 0.6f + textSize
         canvas.drawText(produceLine, pad * 2f, y, hudTextPaint)
         y += lineGap
-        canvas.drawText(stageLine, pad * 2f, y, hudTextPaint)
+        canvas.drawText(cropLine, pad * 2f, y, hudTextPaint)
         y += lineGap
         canvas.drawText(statusLine, pad * 2f, y, hudStatusPaint)
     }
 
     companion object {
         private const val FRAME_INTERVAL_MS = 1500L
-        private const val NUM_PLOTS = 5
+        private const val WALK_LERP = 0.25f // how fast the farmer eases toward his target x
+
+        // DEBUG fast-forward: each long-press adds this much qualifying time.
+        private const val DEBUG_FASTFORWARD = true
+        private const val DEBUG_FASTFORWARD_SECONDS = 60L * 5 // +5 qualifying minutes per long-press
     }
 }
