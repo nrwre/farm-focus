@@ -82,6 +82,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         FarmRepository.onLauncherPaused()
+        farmView.onPaused()
     }
 
     @Deprecated("Deprecated in Java")

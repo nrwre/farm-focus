@@ -42,7 +42,8 @@ object Sprites {
         val id = res.getIdentifier(name, "drawable", context.packageName)
         val bmp = if (id != 0) {
             try {
-                BitmapFactory.decodeResource(res, id)
+                val opts = BitmapFactory.Options().apply { inScaled = false }
+                trimTransparent(BitmapFactory.decodeResource(res, id, opts))
             } catch (t: Throwable) {
                 null
             }
@@ -51,5 +52,32 @@ object Sprites {
         }
         cache[name] = bmp
         return bmp
+    }
+
+    /**
+     * Crops away fully-transparent borders so a sprite's visible art fills its
+     * box. Without this, padding baked into the PNG makes things look like they
+     * hover and makes scaling inconsistent between assets.
+     */
+    private fun trimTransparent(src: Bitmap?): Bitmap? {
+        if (src == null) return null
+        val w = src.width
+        val h = src.height
+        val row = IntArray(w)
+        var minX = w; var minY = h; var maxX = -1; var maxY = -1
+        for (y in 0 until h) {
+            src.getPixels(row, 0, w, 0, y, w, 1)
+            for (x in 0 until w) {
+                if ((row[x] ushr 24) and 0xFF > 8) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+        if (maxX < minX || maxY < minY) return src // fully transparent or opaque edge-to-edge
+        if (minX == 0 && minY == 0 && maxX == w - 1 && maxY == h - 1) return src
+        return Bitmap.createBitmap(src, minX, minY, maxX - minX + 1, maxY - minY + 1)
     }
 }
