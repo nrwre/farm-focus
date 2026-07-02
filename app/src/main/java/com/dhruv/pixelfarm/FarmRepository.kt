@@ -2,7 +2,6 @@ package com.dhruv.pixelfarm
 
 import android.content.Context
 import android.content.SharedPreferences
-import java.util.Calendar
 
 /**
  * Single source of truth for farm state.
@@ -21,24 +20,22 @@ object FarmRepository {
     private const val KEY_SCREEN_ON = "screen_on"
     private const val KEY_LAUNCHER_FOREGROUND = "launcher_foreground"
 
-    // Economy constants (tune-able, not magic numbers).
-    const val SECONDS_PER_GROWTH_STAGE = 60L * 15 // 15 qualifying minutes per stage
+    // Economy constants (tune-able, not magic numbers). Growth is accelerated
+    // so progress is tangible -- seconds per stage, not minutes -- while still
+    // being driven purely by qualifying (farming) time.
+    const val SECONDS_PER_GROWTH_STAGE = 20L // qualifying seconds per growth stage
     const val STAGES = 5 // seed -> sprout -> ... -> harvest-ready
     const val PLOTS = 5 // plots in the field
-    const val EMPTY_PLOT = -1 // getPlotStage() sentinel: soil prepared but nothing planted yet
+    const val EMPTY_PLOT = -1 // getPlotStage() sentinel: no crop right now (unplanted or just harvested)
 
-    // A new plot is planted this often (in qualifying time), so the field
-    // fills in left-to-right as restraint accumulates instead of all at once.
-    const val PLANT_INTERVAL_SECONDS = 60L * 5 // one new plot every 5 qualifying minutes
+    // A new plot is planted this often (in qualifying time), so the field fills
+    // in left-to-right the first time instead of all at once.
+    const val PLANT_INTERVAL_SECONDS = 8L
 
-    // Farmer's daily routine, in wall-clock seconds. Realistic dwell times so
-    // he settles into an activity instead of flickering between them.
-    private const val WATER_SECONDS_PER_PLOT = 10L
-    private const val PLOUGH_SECONDS = 60L * 20
-    private const val IDLE_SECONDS = 60L
-    private const val NAP_SECONDS = 60L * 15
-    private val DAY_CYCLE_SECONDS =
-        PLOTS * WATER_SECONDS_PER_PLOT + PLOUGH_SECONDS + IDLE_SECONDS + NAP_SECONDS
+    // After a plot ripens it's harvested and lies fallow briefly, then regrows
+    // -- so the farm keeps living instead of freezing once everything is ripe.
+    private const val FALLOW_SECONDS = 12L
+    private const val PLOT_CYCLE_SECONDS = SECONDS_PER_GROWTH_STAGE * STAGES + FALLOW_SECONDS
 
     enum class FarmerAction { PLOUGH, WATER, NAP, IDLE }
 
@@ -135,17 +132,22 @@ object FarmRepository {
     }
 
     /**
-     * Growth stage of plot [index], or [EMPTY_PLOT] if it hasn't been planted
-     * yet. Plots are planted one every [PLANT_INTERVAL_SECONDS] of qualifying
-     * time, so the field fills in left-to-right and each plot then climbs the
-     * growth stages -- the whole field ends lush after sustained restraint and
-     * stays that way (no reset in v1).
+     * Growth stage of plot [index], or [EMPTY_PLOT] when it currently holds no
+     * crop (not planted yet the first time, or freshly harvested and lying
+     * fallow). Plots are staggered by [PLANT_INTERVAL_SECONDS] so the field
+     * fills left-to-right, then each plot loops: seed -> ripe -> harvested ->
+     * regrow. Everything is driven by qualifying time, so the farm keeps living
+     * as long as you keep earning farming time.
      */
     fun getPlotStage(index: Int): Int {
         val plantedAt = index * PLANT_INTERVAL_SECONDS
         val age = producePoints - plantedAt
-        if (age < 0) return EMPTY_PLOT
-        return (age / SECONDS_PER_GROWTH_STAGE).toInt().coerceAtMost(STAGES - 1)
+        if (age < 0) return EMPTY_PLOT // not planted for the first time yet
+
+        val posInCycle = age % PLOT_CYCLE_SECONDS
+        val growSpan = SECONDS_PER_GROWTH_STAGE * STAGES
+        if (posInCycle >= growSpan) return EMPTY_PLOT // harvested, lying fallow
+        return (posInCycle / SECONDS_PER_GROWTH_STAGE).toInt().coerceAtMost(STAGES - 1)
     }
 
     /** How many plots are fully grown (harvest-ready). */
@@ -167,42 +169,31 @@ object FarmRepository {
         }
     }
 
-    private fun isNight(): Boolean {
-        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-        return hour < 6 || hour >= 22
-    }
-
     /**
-     * The farmer's current activity. Driven by [sessionElapsedSec] -- seconds
-     * since the user opened the launcher -- so he greets you by watering the
-     * crops first, then settles into the longer tasks (rather than the watering
-     * pass happening at some fixed clock time you'd never catch). He dwells on
-     * each task for realistic stretches instead of flickering. One loop:
-     * water every plot (~10s each) -> plough (20m) -> idle (1m) -> nap (15m).
-     * At night he just sleeps.
+     * The farmer's current activity, tied to the accelerated [DayClock] so it
+     * reads as a living daily routine:
+     *   night         -> sleeps
+     *   early morning  -> wakes, idles
+     *   morning        -> walks the field watering each plot in turn
+     *   afternoon      -> ploughs
+     *   evening        -> idles / winds down
+     * Watered soil stays wet from the morning pass through the evening, then
+     * dries overnight.
      */
-    fun getFarmerState(sessionElapsedSec: Long, ignoreNight: Boolean = false): FarmerState {
-        if (isNight() && !ignoreNight) {
-            return FarmerState(FarmerAction.NAP, -1, emptySet())
-        }
-
-        var pos = sessionElapsedSec % DAY_CYCLE_SECONDS
-
-        val waterPhase = PLOTS * WATER_SECONDS_PER_PLOT
-        if (pos < waterPhase) {
-            val plot = (pos / WATER_SECONDS_PER_PLOT).toInt()
-            // plots already passed are wet; the current one becomes wet as he finishes
-            val alreadyWatered = (0 until plot).toSet()
-            return FarmerState(FarmerAction.WATER, plot, alreadyWatered)
-        }
-        pos -= waterPhase
-
-        // once watering is done the whole field stays wet until the next pass
+    fun getFarmerState(): FarmerState {
+        val p = DayClock.progress()
         val allWatered = (0 until PLOTS).toSet()
-        if (pos < PLOUGH_SECONDS) return FarmerState(FarmerAction.PLOUGH, -1, allWatered)
-        pos -= PLOUGH_SECONDS
-
-        if (pos < IDLE_SECONDS) return FarmerState(FarmerAction.IDLE, -1, allWatered)
-        return FarmerState(FarmerAction.NAP, -1, allWatered)
+        return when (DayClock.phase(p)) {
+            DayClock.Phase.NIGHT -> FarmerState(FarmerAction.NAP, -1, emptySet())
+            DayClock.Phase.EARLY_MORNING -> FarmerState(FarmerAction.IDLE, -1, emptySet())
+            DayClock.Phase.MORNING -> {
+                // sweep across the plots over the course of the morning
+                val frac = DayClock.phaseFraction(p)
+                val plot = (frac * PLOTS).toInt().coerceIn(0, PLOTS - 1)
+                FarmerState(FarmerAction.WATER, plot, (0 until plot).toSet())
+            }
+            DayClock.Phase.AFTERNOON -> FarmerState(FarmerAction.PLOUGH, -1, allWatered)
+            DayClock.Phase.EVENING -> FarmerState(FarmerAction.IDLE, -1, allWatered)
+        }
     }
 }
