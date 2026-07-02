@@ -97,9 +97,27 @@ object FarmRepository {
             .apply()
     }
 
-    fun getCropStage(): Int {
-        val posInCycle = producePoints % CYCLE_SECONDS
+    /**
+     * Current crop stage. [offsetSec] lets the renderer stagger a row of plots
+     * so the field shows a range of growth at once -- purely cosmetic, the
+     * accrual math stays centralized here.
+     */
+    fun getCropStage(offsetSec: Long = 0L): Int {
+        val posInCycle = (producePoints + offsetSec) % CYCLE_SECONDS
         return (posInCycle / SECONDS_PER_GROWTH_STAGE).toInt().coerceIn(0, STAGES - 1)
+    }
+
+    /** Human-readable qualifying-time total, e.g. "1h 20m", "5m 12s", "40s". */
+    fun formatProduceTime(): String {
+        val total = producePoints
+        val h = total / 3600
+        val m = (total % 3600) / 60
+        val s = total % 60
+        return when {
+            h > 0 -> "${h}h ${m}m"
+            m > 0 -> "${m}m ${s}s"
+            else -> "${s}s"
+        }
     }
 
     /** Farmer action for the given animation frame. Naps more often at night. */
